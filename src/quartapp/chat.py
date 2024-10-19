@@ -94,3 +94,5 @@ async def chat_handler():
             yield json.dumps({"error": str(e)}, ensure_ascii=False) + "\n"
 
     return Response(response_stream())
+
+#hello
