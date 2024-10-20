@@ -1,14 +1,12 @@
 import json
 import os
-import uuid
-from datetime import datetime
+
 from azure.identity.aio import (
     AzureDeveloperCliCredential,
     ChainedTokenCredential,
     ManagedIdentityCredential,
     get_bearer_token_provider,
 )
-from azure.cosmos import CosmosClient, PartitionKey
 from openai import AsyncAzureOpenAI
 from quart import (
     Blueprint,
@@ -23,104 +21,44 @@ bp = Blueprint("chat", __name__, template_folder="templates", static_folder="sta
 
 @bp.before_app_serving
 async def configure_openai():
-    # Setup Cosmos DB client
-    cosmos_client = CosmosClient(os.getenv("COSMOS_ENDPOINT"), os.getenv("COSMOS_KEY"))
-    
-    try:
-        # Create the database if it doesn't exist
-        database = cosmos_client.create_database_if_not_exists(id="chatdb")
-        
-        # Define the partition key (ensure this field exists in your documents)
-        partition_key = "/user_id"
 
-        # Create the container if it doesn't exist
-        container = database.create_container_if_not_exists(
-            id="chathistory",
-            partition_key=PartitionKey(path=partition_key)
-        )
-        bp.container = container  # Store the container globally for later use
-        current_app.logger.info("Container 'chathistory' created or already exists.")
-
-    except Exception as e:
-        current_app.logger.error(f"Failed to configure Cosmos DB: {e}")
-        raise
-
-    # Azure credentials setup
+    # Use ManagedIdentityCredential with the client_id for user-assigned managed identities
     user_assigned_managed_identity_credential = ManagedIdentityCredential(client_id=os.getenv("AZURE_CLIENT_ID"))
+
+    # Use AzureDeveloperCliCredential with the current tenant.
     azure_dev_cli_credential = AzureDeveloperCliCredential(tenant_id=os.getenv("AZURE_TENANT_ID"), process_timeout=60)
+
+    # Create a ChainedTokenCredential with ManagedIdentityCredential and AzureDeveloperCliCredential
+    #  - ManagedIdentityCredential is used for deployment on Azure Container Apps
+
+    #  - AzureDeveloperCliCredential is used for local development
+    # The order of the credentials is important, as the first valid token is used
+    # For more information check out:
+
+    # https://learn.microsoft.com/azure/developer/python/sdk/authentication/credential-chains?tabs=ctc#chainedtokencredential-overview
     azure_credential = ChainedTokenCredential(user_assigned_managed_identity_credential, azure_dev_cli_credential)
-
     current_app.logger.info("Using Azure OpenAI with credential")
-    token_provider = get_bearer_token_provider(azure_credential, "https://cognitiveservices.azure.com/.default")
 
+    # Get the token provider for Azure OpenAI based on the selected Azure credential
+    token_provider = get_bearer_token_provider(azure_credential, "https://cognitiveservices.azure.com/.default")
     if not os.getenv("AZURE_OPENAI_ENDPOINT"):
         raise ValueError("AZURE_OPENAI_ENDPOINT is required for Azure OpenAI")
     if not os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT"):
         raise ValueError("AZURE_OPENAI_CHAT_DEPLOYMENT is required for Azure OpenAI")
 
-    # Setup OpenAI client
+    # Create the Asynchronous Azure OpenAI client
     bp.openai_client = AsyncAzureOpenAI(
         api_version=os.getenv("AZURE_OPENAI_API_VERSION") or "2024-02-15-preview",
         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         azure_ad_token_provider=token_provider,
     )
+    # Set the model name to the Azure OpenAI model deployment name
     bp.openai_model = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
-
-
-# Function to log chat interactions to Cosmos DB
-async def log_chat_to_cosmos(user_id, user_input, bot_response):
-    await bp.container.upsert_item({
-        "id": str(uuid.uuid4()),  # Unique ID for each log entry
-        "user_id": user_id,
-        "user_input": user_input,
-        "bot_response": bot_response,
-        "timestamp": str(datetime.utcnow())
-    })
-
-
-@bp.route("/chat", methods=["POST"])
-async def handle_chat():
-    try:
-        # Log the incoming request
-        data = await request.get_json()
-        current_app.logger.info(f"Received input: {data}")
-        
-        user_input = data.get("user_input")
-        if not user_input:
-            raise ValueError("user_input is required.")
-
-        # Call OpenAI API for chat response
-        response = await bp.openai_client.chat.completions.create(
-        model=bp.openai_model,
-        messages=[{"role": "user", "content": user_input}]
-    )
-
-        bot_response = response['choices'][0]['message']['content']
-
-        # Log the OpenAI response
-        current_app.logger.info(f"OpenAI response: {bot_response}")
-
-        # Log chat to Cosmos DB
-        await log_chat_to_cosmos(user_id="user123", user_input=user_input, bot_response=bot_response)
-
-        return {"response": bot_response}
-    
-    except Exception as e:
-        # Log the error
-        current_app.logger.error(f"Error in handle_chat: {e}")
-        return {"error": str(e)}, 500
-
-
-# Optional: Function to retrieve chat history
-async def get_chat_history(user_id):
-    query = f"SELECT * FROM c WHERE c.user_id = '{user_id}' ORDER BY c.timestamp DESC"
-    items = list(bp.container.query_items(query=query, enable_cross_partition_query=True))
-    return items
 
 
 @bp.after_app_serving
 async def shutdown_openai():
-    await bp.openai_client.aclose()
+    await bp.openai_client.close()
 
 
 @bp.get("/")
@@ -132,25 +70,27 @@ async def index():
 async def chat_handler():
     data = await request.get_json()
     request_messages = data.get("messages", [])
-    new_session = data.get("new_session", False)
+    new_session = data.get("new_session", False)  # Asegúrate de que el frontend envíe esto
 
-    # Define the system message
+    # Definir el mensaje del sistema
     system_message = {
         "role": "system",
         "content": (
             "Eres Amigo, un coach de dieta y actividad física impulsado por inteligencia artificial, "
-            "diseñado específicamente para la comunidad hispana/latina. Proporcionas planes de dieta personalizados "
-            "basados en preferencias culturales, seguimiento de actividades con establecimiento de metas y monitoreo de progreso, "
-            "así como consejos diarios interactivos y mensajes motivacionales. Tus respuestas deben ser en español, claras, empáticas "
-            "y respetuosas de las tradiciones y costumbres culturales de los usuarios. Asegúrate de incorporar alimentos tradicionales "
-            "y prácticas culturales en tus recomendaciones para fomentar una experiencia personalizada y efectiva."
+            "especialmente diseñado para la comunidad hispana y latina. Tu misión es proporcionar planes de dieta personalizados "
+            "que respeten y celebren las tradiciones culinarias y preferencias culturales de tus usuarios. Además, ofreces "
+            "seguimiento de actividades físicas con establecimiento de metas realistas y monitoreo de progreso continuo. "
+            "Proporcionas consejos diarios interactivos, mensajes motivacionales y apoyo emocional para fomentar un estilo de vida saludable. "
+            "Tus respuestas deben ser en español, claras, empáticas y respetuosas de las diversas tradiciones y costumbres culturales de los usuarios. "
+            "Incorpora alimentos tradicionales y prácticas culturales en tus recomendaciones para asegurar una experiencia personalizada, "
+            "relevante y efectiva. Además, adapta tus sugerencias a las diferentes regiones hispanas, reconociendo la diversidad dentro de la comunidad."
         )
     }
 
     all_messages = [system_message]
 
     if new_session:
-        # Add welcome message for new sessions
+        # Añadir el mensaje de bienvenida
         welcome_message = {
             "role": "assistant",
             "content": (
@@ -161,7 +101,7 @@ async def chat_handler():
         }
         all_messages.append(welcome_message)
 
-    # Add user messages
+    # Añadir los mensajes del usuario
     all_messages.extend(request_messages)
 
     chat_coroutine = bp.openai_client.chat.completions.create(
