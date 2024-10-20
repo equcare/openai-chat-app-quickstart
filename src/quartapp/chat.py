@@ -19,7 +19,6 @@ from quart import (
 
 bp = Blueprint("chat", __name__, template_folder="templates", static_folder="static")
 
-
 @bp.before_app_serving
 async def configure_openai():
 
@@ -69,21 +68,48 @@ async def index():
 
 @bp.post("/chat/stream")
 async def chat_handler():
-    request_messages = (await request.get_json())["messages"]
+    data = await request.get_json()
+    request_messages = data.get("messages", [])
+    new_session = data.get("new_session", False)  # Asegúrate de que el frontend envíe esto
+
+    # Definir el mensaje del sistema
+    system_message = {
+        "role": "system",
+        "content": (
+            "Eres Amigo, un coach de dieta y actividad física impulsado por inteligencia artificial, "
+            "diseñado específicamente para la comunidad hispana/latina. Proporcionas planes de dieta personalizados "
+            "basados en preferencias culturales, seguimiento de actividades con establecimiento de metas y monitoreo de progreso, "
+            "así como consejos diarios interactivos y mensajes motivacionales. Tus respuestas deben ser en español, claras, empáticas "
+            "y respetuosas de las tradiciones y costumbres culturales de los usuarios. Asegúrate de incorporar alimentos tradicionales "
+            "y prácticas culturales en tus recomendaciones para fomentar una experiencia personalizada y efectiva."
+        )
+    }
+
+    all_messages = [system_message]
+
+    if new_session:
+        # Añadir el mensaje de bienvenida
+        welcome_message = {
+            "role": "assistant",
+            "content": (
+                "¡Hola! Soy Amigo, tu coach personalizado de dieta y actividad física. "
+                "Estoy aquí para ayudarte a alcanzar tus objetivos de salud de manera adaptada a tus preferencias culturales. "
+                "Para comenzar, cuéntame un poco sobre tus metas o el tipo de apoyo que necesitas hoy."
+            )
+        }
+        all_messages.append(welcome_message)
+
+    # Añadir los mensajes del usuario
+    all_messages.extend(request_messages)
+
+    chat_coroutine = bp.openai_client.chat.completions.create(
+        model=bp.openai_model,
+        messages=all_messages,
+        stream=True,
+    )
 
     @stream_with_context
     async def response_stream():
-        # This sends all messages, so API request may exceed token limits
-        all_messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-        ] + request_messages
-
-        chat_coroutine = bp.openai_client.chat.completions.create(
-            # Azure Open AI takes the deployment name as the model name
-            model=bp.openai_model,
-            messages=all_messages,
-            stream=True,
-        )
         try:
             async for event in await chat_coroutine:
                 event_dict = event.model_dump()
@@ -94,5 +120,3 @@ async def chat_handler():
             yield json.dumps({"error": str(e)}, ensure_ascii=False) + "\n"
 
     return Response(response_stream())
-
-#hello
