@@ -1,7 +1,5 @@
 import json
 import os
-from datetime import datetime
-import aiofiles  # Import aiofiles for async file I/O
 
 from azure.identity.aio import (
     AzureDeveloperCliCredential,
@@ -21,26 +19,40 @@ from quart import (
 
 bp = Blueprint("chat", __name__, template_folder="templates", static_folder="static")
 
-CHAT_LOG_FILE = "chat_log.json"  # The file where the chat logs will be stored
-
 @bp.before_app_serving
 async def configure_openai():
+
+    # Use ManagedIdentityCredential with the client_id for user-assigned managed identities
     user_assigned_managed_identity_credential = ManagedIdentityCredential(client_id=os.getenv("AZURE_CLIENT_ID"))
+
+    # Use AzureDeveloperCliCredential with the current tenant.
     azure_dev_cli_credential = AzureDeveloperCliCredential(tenant_id=os.getenv("AZURE_TENANT_ID"), process_timeout=60)
+
+    # Create a ChainedTokenCredential with ManagedIdentityCredential and AzureDeveloperCliCredential
+    #  - ManagedIdentityCredential is used for deployment on Azure Container Apps
+
+    #  - AzureDeveloperCliCredential is used for local development
+    # The order of the credentials is important, as the first valid token is used
+    # For more information check out:
+
+    # https://learn.microsoft.com/azure/developer/python/sdk/authentication/credential-chains?tabs=ctc#chainedtokencredential-overview
     azure_credential = ChainedTokenCredential(user_assigned_managed_identity_credential, azure_dev_cli_credential)
     current_app.logger.info("Using Azure OpenAI with credential")
 
+    # Get the token provider for Azure OpenAI based on the selected Azure credential
     token_provider = get_bearer_token_provider(azure_credential, "https://cognitiveservices.azure.com/.default")
     if not os.getenv("AZURE_OPENAI_ENDPOINT"):
         raise ValueError("AZURE_OPENAI_ENDPOINT is required for Azure OpenAI")
     if not os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT"):
         raise ValueError("AZURE_OPENAI_CHAT_DEPLOYMENT is required for Azure OpenAI")
 
+    # Create the Asynchronous Azure OpenAI client
     bp.openai_client = AsyncAzureOpenAI(
         api_version=os.getenv("AZURE_OPENAI_API_VERSION") or "2024-02-15-preview",
         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         azure_ad_token_provider=token_provider,
     )
+    # Set the model name to the Azure OpenAI model deployment name
     bp.openai_model = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
 
 
@@ -54,66 +66,71 @@ async def index():
     return await render_template("index.html")
 
 
-async def log_chat_message(message):
-    """Log the chat message to a JSON file asynchronously."""
-    log_entry = {
-        "timestamp": datetime.now().isoformat(),
-        "role": message["role"],
-        "content": message["content"]
-    }
-
-    # Ensure the chat log file exists and append the message asynchronously
-    if os.path.exists(CHAT_LOG_FILE):
-        async with aiofiles.open(CHAT_LOG_FILE, "r+", encoding="utf-8") as file:
-            chat_log = json.loads(await file.read())
-            chat_log.append(log_entry)
-            await file.seek(0)
-            await file.write(json.dumps(chat_log, ensure_ascii=False, indent=2))
-    else:
-        async with aiofiles.open(CHAT_LOG_FILE, "w", encoding="utf-8") as file:
-            await file.write(json.dumps([log_entry], ensure_ascii=False, indent=2))
-
-
 @bp.post("/chat/stream")
 async def chat_handler():
     data = await request.get_json()
     request_messages = data.get("messages", [])
-    new_session = data.get("new_session", False)
+    new_session = data.get("new_session", False)  # Asegúrate de que el frontend envíe esto
 
+    # Definir el mensaje del sistema
     system_message = {
         "role": "system",
         "content": (
-            "Eres Amigo, un coach de dieta y actividad física impulsado por inteligencia artificial, "
-            "especialmente diseñado para la comunidad hispana y latina. Tu misión es proporcionar planes de dieta personalizados "
-            "que respeten y celebren las tradiciones culinarias y preferencias culturales de tus usuarios. Además, ofreces "
-            "seguimiento de actividades físicas con establecimiento de metas realistas y monitoreo de progreso continuo. "
-            "Proporcionas consejos diarios interactivos, mensajes motivacionales y apoyo emocional para fomentar un estilo de vida saludable. "
-            "Tus respuestas deben ser en español, claras, empáticas y respetuosas de las diversas tradiciones y costumbres culturales de los usuarios. "
-            "Incorpora alimentos tradicionales y prácticas culturales en tus recomendaciones para asegurar una experiencia personalizada, "
-            "relevante y efectiva. Además, adapta tus sugerencias a las diferentes regiones hispanas, reconociendo la diversidad dentro de la comunidad."
+            "Eres Amigo, un coach motivador y cercano que combina la calidez latina con expertise en salud y bienestar. "
+            "Tu personalidad es alegre, empática y motivadora - como ese amigo sabio de la familia que siempre tiene un buen consejo "
+            "y una palabra de aliento. Características principales:\n\n"
+            
+            "PERSONALIDAD:\n"
+            "- Usas un lenguaje cercano y coloquial, pero siempre profesional\n"
+            "- Incorporas dichos y expresiones populares latinos cuando es apropiado\n"
+            "- Tienes sentido del humor y mantienes un tono optimista\n"
+            "- Eres comprensivo con los desafíos y celebras los pequeños logros\n\n"
+            
+            "EXPERTO:\n"
+            "- Adaptas recetas tradicionales latinos para hacerlas más saludables sin perder sabor\n"
+            "- Entiendes las dinámicas familiares y sociales de la cultura latina\n"
+            "- Proporcionas alternativas saludables para ocasiones especiales y festividades\n"
+            "- Sugieres ejercicios que se pueden hacer en casa o con recursos limitados\n\n"
+            
+            "ENFOQUE:\n"
+            "- Promueves cambios graduales y sostenibles, no dietas restrictivas\n"
+            "- Respetas las tradiciones culinarias mientras introduces mejoras saludables\n"
+            "- Consideras el presupuesto y acceso a alimentos del usuario\n"
+            "- Motivas desde el amor propio y la salud, no desde la vergüenza\n"
+            "- Reconoces la importancia de la familia y la comunidad en el proceso\n\n"
+            
+            "Tu objetivo es ser más que un simple coach - eres un compañero de viaje que inspira, educa y "
+            "acompaña a cada persona en su camino hacia una vida más saludable, siempre respetando su "
+            "identidad cultural y circunstancias personales."
         )
     }
 
     all_messages = [system_message]
-    await log_chat_message(system_message)  # Log the system message asynchronously
 
     if new_session:
+        # Añadir el mensaje de bienvenida
         welcome_message = {
             "role": "assistant",
             "content": (
-                "¡Hola! Soy Amigo, tu coach personalizado de dieta y actividad física. "
-                "Estoy aquí para ayudarte a alcanzar tus objetivos de salud de manera adaptada a tus preferencias culturales. "
-                "Para comenzar, cuéntame un poco sobre tus metas o el tipo de apoyo que necesitas hoy."
+                "¡Hola! 👋 ¡Qué gusto conocerte! Soy Amigo, tu compañero personal en este viaje hacia una vida más saludable. "
+                "Como latino que soy, entiendo que la buena salud y la buena comida van de la mano con la alegría de vivir. "
+                "No vengo a quitarte tus platos favoritos ni a imponerte rutinas imposibles - ¡vengo a ayudarte a encontrar "
+                "ese balance perfecto entre lo delicioso y lo saludable! 💪✨\n\n"
+                
+                "Cuéntame, ¿qué te gustaría lograr? Ya sea que quieras:\n"
+                "• Sentirte con más energía\n"
+                "• Mejorar tu alimentación sin renunciar a los sabores de casa\n"
+                "• Encontrar ejercicios que se ajusten a tu rutina\n"
+                "• O simplemente dar el primer paso hacia una vida más saludable\n\n"
+                
+                "Estoy aquí para escucharte y crear un plan que funcione para TI, tu familia y tu estilo de vida. "
+                "¡Juntos vamos a hacer que este proceso sea divertido y sostenible! ¿Por dónde te gustaría empezar?"
             )
         }
         all_messages.append(welcome_message)
-        await log_chat_message(welcome_message)  # Log the welcome message asynchronously
 
+    # Añadir los mensajes del usuario
     all_messages.extend(request_messages)
-
-    # Log user messages asynchronously
-    for message in request_messages:
-        await log_chat_message(message)
 
     chat_coroutine = bp.openai_client.chat.completions.create(
         model=bp.openai_model,
@@ -126,11 +143,10 @@ async def chat_handler():
         try:
             async for event in await chat_coroutine:
                 event_dict = event.model_dump()
-                if event_dict.get("choices"):
-                    assistant_message = event_dict["choices"][0].get("delta", {}).get("content", "")
-                    if assistant_message:
-                        await log_chat_message({"role": "assistant", "content": assistant_message})  # Log the assistant's response asynchronously
-                        yield json.dumps({"role": "assistant", "content": assistant_message}, ensure_ascii=False) + "\n"
+                if event_dict["choices"]:
+                    yield json.dumps(event_dict["choices"][0], ensure_ascii=False) + "\n"
         except Exception as e:
             current_app.logger.error(e)
             yield json.dumps({"error": str(e)}, ensure_ascii=False) + "\n"
+
+    return Response(response_stream())
