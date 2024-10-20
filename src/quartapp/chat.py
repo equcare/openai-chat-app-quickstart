@@ -126,12 +126,11 @@ async def chat_handler():
         try:
             async for event in await chat_coroutine:
                 event_dict = event.model_dump()
-                if event_dict["choices"]:
-                    assistant_message = event_dict["choices"][0]["message"]
-                    await log_chat_message(assistant_message)  # Log the assistant's response asynchronously
-                    yield json.dumps(assistant_message, ensure_ascii=False) + "\n"
+                if event_dict.get("choices"):
+                    assistant_message = event_dict["choices"][0].get("delta", {}).get("content", "")
+                    if assistant_message:
+                        await log_chat_message({"role": "assistant", "content": assistant_message})  # Log the assistant's response asynchronously
+                        yield json.dumps({"role": "assistant", "content": assistant_message}, ensure_ascii=False) + "\n"
         except Exception as e:
             current_app.logger.error(e)
             yield json.dumps({"error": str(e)}, ensure_ascii=False) + "\n"
-
-    return Response(response_stream())
