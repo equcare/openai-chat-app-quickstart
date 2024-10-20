@@ -8,7 +8,7 @@ from azure.identity.aio import (
     ManagedIdentityCredential,
     get_bearer_token_provider,
 )
-from azure.cosmos import CosmosClient
+from azure.cosmos import CosmosClient, PartitionKey
 from openai import AsyncAzureOpenAI
 from quart import (
     Blueprint,
@@ -21,14 +21,29 @@ from quart import (
 
 bp = Blueprint("chat", __name__, template_folder="templates", static_folder="static")
 
-
 @bp.before_app_serving
 async def configure_openai():
     # Setup Cosmos DB client
     cosmos_client = CosmosClient(os.getenv("COSMOS_ENDPOINT"), os.getenv("COSMOS_KEY"))
-    database = cosmos_client.create_database_if_not_exists(id="chatdb")
-    container = database.create_container_if_not_exists(id="chathistory", partition_key="/user_id")
-    bp.container = container  # Store the container globally for later use
+    
+    try:
+        # Create the database if it doesn't exist
+        database = cosmos_client.create_database_if_not_exists(id="chatdb")
+        
+        # Define the partition key (ensure this field exists in your documents)
+        partition_key = "/user_id"
+
+        # Create the container if it doesn't exist
+        container = database.create_container_if_not_exists(
+            id="chathistory",
+            partition_key=PartitionKey(path=partition_key)
+        )
+        bp.container = container  # Store the container globally for later use
+        current_app.logger.info("Container 'chathistory' created or already exists.")
+
+    except Exception as e:
+        current_app.logger.error(f"Failed to configure Cosmos DB: {e}")
+        raise
 
     # Azure credentials setup
     user_assigned_managed_identity_credential = ManagedIdentityCredential(client_id=os.getenv("AZURE_CLIENT_ID"))
@@ -65,20 +80,35 @@ async def log_chat_to_cosmos(user_id, user_input, bot_response):
 
 @bp.route("/chat", methods=["POST"])
 async def handle_chat():
-    data = await request.get_json()
-    user_input = data.get("user_input")
-    
-    # Call OpenAI API for chat response
-    response = await bp.openai_client.create_chat_completion(
-        deployment_id=bp.openai_model,
+    try:
+        # Log the incoming request
+        data = await request.get_json()
+        current_app.logger.info(f"Received input: {data}")
+        
+        user_input = data.get("user_input")
+        if not user_input:
+            raise ValueError("user_input is required.")
+
+        # Call OpenAI API for chat response
+        response = await bp.openai_client.chat.completions.create(
+        model=bp.openai_model,
         messages=[{"role": "user", "content": user_input}]
     )
-    bot_response = response.choices[0].message['content']
 
-    # Log chat to Cosmos DB
-    await log_chat_to_cosmos(user_id="user123", user_input=user_input, bot_response=bot_response)
+        bot_response = response['choices'][0]['message']['content']
 
-    return {"response": bot_response}
+        # Log the OpenAI response
+        current_app.logger.info(f"OpenAI response: {bot_response}")
+
+        # Log chat to Cosmos DB
+        await log_chat_to_cosmos(user_id="user123", user_input=user_input, bot_response=bot_response)
+
+        return {"response": bot_response}
+    
+    except Exception as e:
+        # Log the error
+        current_app.logger.error(f"Error in handle_chat: {e}")
+        return {"error": str(e)}, 500
 
 
 # Optional: Function to retrieve chat history
@@ -143,7 +173,7 @@ async def chat_handler():
     @stream_with_context
     async def response_stream():
         try:
-            async for event in chat_coroutine:
+            async for event in await chat_coroutine:
                 event_dict = event.model_dump()
                 if event_dict["choices"]:
                     yield json.dumps(event_dict["choices"][0], ensure_ascii=False) + "\n"
