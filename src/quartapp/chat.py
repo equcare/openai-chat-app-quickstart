@@ -1,5 +1,7 @@
 import json
 import os
+from datetime import datetime
+import aiofiles  # Import aiofiles for async file I/O
 
 from azure.identity.aio import (
     AzureDeveloperCliCredential,
@@ -19,40 +21,26 @@ from quart import (
 
 bp = Blueprint("chat", __name__, template_folder="templates", static_folder="static")
 
+CHAT_LOG_FILE = "chat_log.json"  # The file where the chat logs will be stored
+
 @bp.before_app_serving
 async def configure_openai():
-
-    # Use ManagedIdentityCredential with the client_id for user-assigned managed identities
     user_assigned_managed_identity_credential = ManagedIdentityCredential(client_id=os.getenv("AZURE_CLIENT_ID"))
-
-    # Use AzureDeveloperCliCredential with the current tenant.
     azure_dev_cli_credential = AzureDeveloperCliCredential(tenant_id=os.getenv("AZURE_TENANT_ID"), process_timeout=60)
-
-    # Create a ChainedTokenCredential with ManagedIdentityCredential and AzureDeveloperCliCredential
-    #  - ManagedIdentityCredential is used for deployment on Azure Container Apps
-
-    #  - AzureDeveloperCliCredential is used for local development
-    # The order of the credentials is important, as the first valid token is used
-    # For more information check out:
-
-    # https://learn.microsoft.com/azure/developer/python/sdk/authentication/credential-chains?tabs=ctc#chainedtokencredential-overview
     azure_credential = ChainedTokenCredential(user_assigned_managed_identity_credential, azure_dev_cli_credential)
     current_app.logger.info("Using Azure OpenAI with credential")
 
-    # Get the token provider for Azure OpenAI based on the selected Azure credential
     token_provider = get_bearer_token_provider(azure_credential, "https://cognitiveservices.azure.com/.default")
     if not os.getenv("AZURE_OPENAI_ENDPOINT"):
         raise ValueError("AZURE_OPENAI_ENDPOINT is required for Azure OpenAI")
     if not os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT"):
         raise ValueError("AZURE_OPENAI_CHAT_DEPLOYMENT is required for Azure OpenAI")
 
-    # Create the Asynchronous Azure OpenAI client
     bp.openai_client = AsyncAzureOpenAI(
         api_version=os.getenv("AZURE_OPENAI_API_VERSION") or "2024-02-15-preview",
         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         azure_ad_token_provider=token_provider,
     )
-    # Set the model name to the Azure OpenAI model deployment name
     bp.openai_model = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
 
 
@@ -66,13 +54,32 @@ async def index():
     return await render_template("index.html")
 
 
+async def log_chat_message(message):
+    """Log the chat message to a JSON file asynchronously."""
+    log_entry = {
+        "timestamp": datetime.now().isoformat(),
+        "role": message["role"],
+        "content": message["content"]
+    }
+
+    # Ensure the chat log file exists and append the message asynchronously
+    if os.path.exists(CHAT_LOG_FILE):
+        async with aiofiles.open(CHAT_LOG_FILE, "r+", encoding="utf-8") as file:
+            chat_log = json.loads(await file.read())
+            chat_log.append(log_entry)
+            await file.seek(0)
+            await file.write(json.dumps(chat_log, ensure_ascii=False, indent=2))
+    else:
+        async with aiofiles.open(CHAT_LOG_FILE, "w", encoding="utf-8") as file:
+            await file.write(json.dumps([log_entry], ensure_ascii=False, indent=2))
+
+
 @bp.post("/chat/stream")
 async def chat_handler():
     data = await request.get_json()
     request_messages = data.get("messages", [])
-    new_session = data.get("new_session", False)  # Asegúrate de que el frontend envíe esto
+    new_session = data.get("new_session", False)
 
-    # Definir el mensaje del sistema
     system_message = {
         "role": "system",
         "content": (
@@ -88,9 +95,9 @@ async def chat_handler():
     }
 
     all_messages = [system_message]
+    await log_chat_message(system_message)  # Log the system message asynchronously
 
     if new_session:
-        # Añadir el mensaje de bienvenida
         welcome_message = {
             "role": "assistant",
             "content": (
@@ -100,9 +107,13 @@ async def chat_handler():
             )
         }
         all_messages.append(welcome_message)
+        await log_chat_message(welcome_message)  # Log the welcome message asynchronously
 
-    # Añadir los mensajes del usuario
     all_messages.extend(request_messages)
+
+    # Log user messages asynchronously
+    for message in request_messages:
+        await log_chat_message(message)
 
     chat_coroutine = bp.openai_client.chat.completions.create(
         model=bp.openai_model,
@@ -116,7 +127,9 @@ async def chat_handler():
             async for event in await chat_coroutine:
                 event_dict = event.model_dump()
                 if event_dict["choices"]:
-                    yield json.dumps(event_dict["choices"][0], ensure_ascii=False) + "\n"
+                    assistant_message = event_dict["choices"][0]["message"]
+                    await log_chat_message(assistant_message)  # Log the assistant's response asynchronously
+                    yield json.dumps(assistant_message, ensure_ascii=False) + "\n"
         except Exception as e:
             current_app.logger.error(e)
             yield json.dumps({"error": str(e)}, ensure_ascii=False) + "\n"
